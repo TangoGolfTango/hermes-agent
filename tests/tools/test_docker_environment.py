@@ -1898,3 +1898,24 @@ def test_docker_env_warnings_never_echo_values(caplog):
     with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
         docker_env._normalize_env_dict({"TOKEN": ["sk-live-value"], "OK": "1"})
     assert "TOKEN" in caplog.text and "sk-live-value" not in caplog.text
+
+
+def test_root_tmpfs_is_traversable_by_host_user(monkeypatch):
+    """With docker_run_as_host_user the sandbox runs unprivileged, and skills,
+    attachments and caches are bind-mounted under /root/.hermes. A tmpfs
+    without a mode comes up 0700 root-owned, so /root must be mode=755 or
+    that user gets "Permission denied" on everything beneath it."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env()
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    tmpfs_vals = [run_args[i + 1] for i, a in enumerate(run_args[:-1]) if a == "--tmpfs"]
+    root_mounts = [v for v in tmpfs_vals if v.startswith("/root:")]
+    assert root_mounts, f"no /root tmpfs mount found in {tmpfs_vals}"
+    assert "mode=755" in root_mounts[0].split(":", 1)[1].split(","), (
+        f"/root must be mode=755 for an unprivileged sandbox user, got: {root_mounts[0]}"
+    )

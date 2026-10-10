@@ -887,7 +887,7 @@ class DockerEnvironment(BaseEnvironment):
                 writable_args += ["-v", f"{self._workspace_dir}:/workspace"]
         else:
             writable_args += ["--tmpfs", "/workspace:rw,exec,size=10g"] if mount_workspace else []
-            writable_args += ["--tmpfs", "/home:rw,exec,size=1g", "--tmpfs", "/root:rw,exec,size=1g"]
+            writable_args += ["--tmpfs", "/home:rw,exec,size=1g", "--tmpfs", "/root:rw,exec,size=1g,mode=755"]
 
         if bind_target:
             logger.info("Mounting configured host cwd to %s: %s", bind_target, host_cwd_abs)

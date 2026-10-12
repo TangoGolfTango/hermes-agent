@@ -246,8 +246,12 @@ class _Collector:
         # Include every platform any secondary profile has live. This is only a
         # coarse pre-filter; exact destination authorization runs before claim
         # and again at delivery, rewinding if the route or adapter changed.
-        self.active_platforms = _platform_names(runner.adapters).union(
+        self.active_platforms = {"bot-chat"} | _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+
+        if getattr(config, "multiplex_profiles", False):
+            from gateway.run import _multiplex_profile_homes
+            self.notifier_profiles.update(name for name, _home in _multiplex_profile_homes(config))
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
@@ -308,7 +312,11 @@ class _Collector:
                          sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
-        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
+        if platform == "bot-chat":
+            from gateway.kanban_bot_chat import subscription_home
+            if subscription_home(self.runner, sub) is None:
+                return None
+        elif _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
@@ -746,6 +754,10 @@ class _KanbanNotification:
         return True
 
     async def deliver(self) -> None:
+        if self.platform_str == "bot-chat":
+            from gateway.kanban_bot_chat import deliver
+            await deliver(self)
+            return
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:

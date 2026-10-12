@@ -85,8 +85,8 @@ _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
-    _arg("--platform", required=True),
-    _arg("--chat-id", required=True),
+    _arg("--platform", required=True, help="Messaging platform, or bot-chat for the owner profile's canonical Bot Chat"),
+    _arg("--chat-id", required=True, help="Chat ID; for bot-chat, the same profile as --notifier-profile"),
     _arg("--thread-id"),
 )
 _STEP_HANDOFF = (

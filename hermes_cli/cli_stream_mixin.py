@@ -50,6 +50,28 @@ def _terminal_columns(default: int = 80) -> int:
         return default
 
 
+def _vision_readable_image(img_path: Path) -> Path:
+    """A path ``vision_analyze`` can read for an attached host image.
+
+    A sandboxed terminal backend reads host files only from the media caches
+    (``tools/image_source.py``); any other host path is looked up inside the
+    container, where it does not exist. Such an image is analyzed as a copy in
+    the image cache, which is also mounted read-only into the sandbox.
+    """
+    from tools import image_source
+    real = img_path.resolve()
+    if image_source._is_local_terminal_backend() or any(
+            real.is_relative_to(root.resolve()) for root in image_source._media_cache_roots()):
+        return img_path
+    # Same ingest cap vision applies to any read; +1 tells "at the cap" from "over".
+    with img_path.open("rb") as handle:
+        data = handle.read(image_source._MAX_INGEST_BYTES + 1)
+    if len(data) > image_source._MAX_INGEST_BYTES:
+        raise ValueError("media exceeds size limit")
+    from gateway.platforms.base import cache_image_from_bytes
+    return Path(cache_image_from_bytes(data, img_path.suffix.lower() or ".png"))
+
+
 class CLIStreamMixin:
     """Streaming output, reasoning preview, tool progress callbacks, and busy-command spinner for the interactive CLI"""
 
@@ -601,6 +623,7 @@ class CLIStreamMixin:
             if announce:
                 _cprint(f"  {_DIM}{t('cli.stream.vision_analyzing', name=img_path.name, size_kb=size_kb)}{_RST}")
             try:
+                img_path = _vision_readable_image(img_path)
                 result_json = _asyncio.run(
                     vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt))
                 result = json.loads(result_json)

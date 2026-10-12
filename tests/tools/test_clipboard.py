@@ -482,6 +482,61 @@ class TestPreprocessImagesWithVision:
         assert "base64," not in result  # no raw base64 image content
 
 
+    def test_sandbox_backend_analyzes_a_copy_vision_can_read(self, cli, tmp_path, monkeypatch):
+        # A container backend reads only media-cache host paths, so an image outside the
+        # cache must be analyzed (and offered for retry) as a cached copy.
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        img = self._make_image(tmp_path)
+        seen = []
+        _succeed = self._mock_vision_success("ok")
+        async def _fake_vision(**kwargs):
+            seen.append(kwargs["image_url"])
+            return await _succeed(**kwargs)
+        with patch("tools.vision_tools.vision_analyze_tool", side_effect=_fake_vision):
+            result = cli._preprocess_images_with_vision("Describe this", [img])
+        assert "Here's what it contains:\nok" in result
+        from tools.image_source import ResolveContext, _permitted_host_read_target
+        staged = Path(seen[0])
+        assert staged != img and staged.read_bytes() == FAKE_PNG
+        assert _permitted_host_read_target(staged, ResolveContext(task_id=None)) is not None
+        assert str(staged) in result and str(img) not in result
+
+    def test_sandbox_backend_rejects_oversize_image_before_caching(self, cli, tmp_path, monkeypatch):
+        # The copy honours the vision ingest cap and reads at most cap + 1 bytes.
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr("tools.image_source._MAX_INGEST_BYTES", len(FAKE_PNG) - 1)
+        img = self._make_image(tmp_path)
+        reads = []
+        real_open = Path.open
+        def _tracking_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if path == img:
+                real_read = handle.read
+                handle.read = lambda size=-1: reads.append(size) or real_read(size)
+            return handle
+        monkeypatch.setattr(Path, "open", _tracking_open)
+        monkeypatch.setattr(Path, "read_bytes", lambda path: pytest.fail(f"unbounded read of {path}"))
+        from gateway.platforms.base import get_image_cache_dir
+        cached_before = set(get_image_cache_dir().iterdir())
+        with patch("tools.vision_tools.vision_analyze_tool", side_effect=self._mock_vision_success()) as vision:
+            result = cli._preprocess_images_with_vision("Describe this", [img])
+        vision.assert_not_called()
+        assert reads == [len(FAKE_PNG)]
+        assert set(get_image_cache_dir().iterdir()) == cached_before
+        assert "media exceeds size limit" in result and str(img) in result
+
+    def test_local_backend_analyzes_the_original_path(self, cli, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = self._make_image(tmp_path)
+        seen = []
+        _succeed = self._mock_vision_success("ok")
+        async def _fake_vision(**kwargs):
+            seen.append(kwargs["image_url"])
+            return await _succeed(**kwargs)
+        with patch("tools.vision_tools.vision_analyze_tool", side_effect=_fake_vision):
+            cli._preprocess_images_with_vision("Describe this", [img])
+        assert seen == [str(img)]
+
     def test_vision_exception_includes_path(self, cli, tmp_path):
         img = self._make_image(tmp_path)
         async def _explode(**kwargs):

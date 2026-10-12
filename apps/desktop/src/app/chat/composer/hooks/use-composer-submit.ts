@@ -37,6 +37,8 @@ interface UseComposerSubmitArgs {
   draftRef: RefObject<string>
   drainNextQueued: () => Promise<boolean>
   editorRef: RefObject<HTMLDivElement | null>
+  /** `display.busy_input_mode: queue`: Enter while busy queues instead of steering. */
+  enterQueues?: boolean
   exitQueuedEdit: (action: 'cancel' | 'save') => boolean
   focusInput: () => void
   inputDisabled: boolean
@@ -73,6 +75,7 @@ export function useComposerSubmit({
   draftRef,
   drainNextQueued,
   editorRef,
+  enterQueues = false,
   exitQueuedEdit,
   focusInput,
   inputDisabled,
@@ -247,7 +250,7 @@ export function useComposerSubmit({
       triggerHaptic('submit')
       clearDraft()
       dispatchSubmit(text)
-    } else if (!blockingPrompt && !attachments.length && text.trim()) {
+    } else if (!enterQueues && !blockingPrompt && !attachments.length && text.trim()) {
       // Cursor-style stop-and-correct: interrupt the live turn and redirect
       // it with this text. redirect() preserves the shown reasoning/work; if
       // the turn already ended, steerDraft re-queues so nothing is lost.
@@ -255,7 +258,8 @@ export function useComposerSubmit({
       // compression lock. The client flag can outlive an aborted compaction.
       steerDraft()
     } else if (payloadPresent) {
-      // Attachments can't ride a redirect (no tool-result image carriage) —
+      // Queue mode lands here for every non-empty draft. Otherwise:
+      // attachments can't ride a redirect (no tool-result image carriage) —
       // queue the whole payload for the next turn. Same for a turn parked on
       // an approval/sudo/secret prompt: a steer can't reach the model while
       // the tool batch is blocked, so the message runs as the next turn.

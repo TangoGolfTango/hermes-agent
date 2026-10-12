@@ -70,40 +70,45 @@ export const useHermesConfigRecord = (profile?: ProfileScope) => {
   // record after a switch.
   const connectionId = useStore($activeConnectionId)
 
-  const query = useQuery({
-    queryKey: hermesConfigKey(profile, connectionId),
-    // null/undefined both mean "no override" → fetch with undefined so
-    // capabilityScoped falls back to the app-wide active profile (passing null
-    // would wrongly target the primary backend).
-    queryFn: () => {
-      // $activeConnectionId.listen invalidates profile queries in the same
-      // turn it publishes the new id, before this observer moves to the new
-      // key. A refetch of the slot we are leaving must not store the new
-      // gateway's record there — that is the other machine's config.yaml.
-      if (connectionId && $activeConnectionId.get() !== connectionId) {
-        const cached = queryClient.getQueryData<HermesConfigRecord>(hermesConfigKey(profile, connectionId))
+  const query = useQuery(
+    {
+      queryKey: hermesConfigKey(profile, connectionId),
+      // null/undefined both mean "no override" → fetch with undefined so
+      // capabilityScoped falls back to the app-wide active profile (passing null
+      // would wrongly target the primary backend).
+      queryFn: () => {
+        // $activeConnectionId.listen invalidates profile queries in the same
+        // turn it publishes the new id, before this observer moves to the new
+        // key. A refetch of the slot we are leaving must not store the new
+        // gateway's record there — that is the other machine's config.yaml.
+        if (connectionId && $activeConnectionId.get() !== connectionId) {
+          const cached = queryClient.getQueryData<HermesConfigRecord>(hermesConfigKey(profile, connectionId))
 
-        if (cached !== undefined) {
-          return cached
+          if (cached !== undefined) {
+            return cached
+          }
         }
-      }
 
-      return getHermesConfigRecord(profile ?? undefined)
+        return getHermesConfigRecord(profile ?? undefined)
+      },
+      staleTime: 0,
+      // Keep structural sharing so an unchanged refetch (every consumer mount at
+      // staleTime 0, every invalidate) yields the SAME object and consumers'
+      // memos/autosave effects don't re-arm. The read origin lives in a WeakMap
+      // keyed by the record, so re-stamp whatever object survives the merge with
+      // the origin of the NEW fetch (`next`, bound by getHermesConfigRecord) —
+      // otherwise a retained object would keep routing writes to the gateway
+      // that served the previous GET.
+      structuralSharing: (previous: unknown, next: unknown) =>
+        retainConfigReadOrigin(
+          replaceEqualDeep(previous as HermesConfigRecord | undefined, next as HermesConfigRecord),
+          next as object
+        )
     },
-    staleTime: 0,
-    // Keep structural sharing so an unchanged refetch (every consumer mount at
-    // staleTime 0, every invalidate) yields the SAME object and consumers'
-    // memos/autosave effects don't re-arm. The read origin lives in a WeakMap
-    // keyed by the record, so re-stamp whatever object survives the merge with
-    // the origin of the NEW fetch (`next`, bound by getHermesConfigRecord) —
-    // otherwise a retained object would keep routing writes to the gateway
-    // that served the previous GET.
-    structuralSharing: (previous: unknown, next: unknown) =>
-      retainConfigReadOrigin(
-        replaceEqualDeep(previous as HermesConfigRecord | undefined, next as HermesConfigRecord),
-        next as object
-      )
-  })
+    // Explicit client (the same singleton main.tsx provides) so surfaces that
+    // can render outside the provider, like the chat composer, still resolve.
+    queryClient
+  )
 
   // Attach `writeScope` as a lazy getter instead of spreading `query`: useQuery
   // hands back a tracked-props Proxy, and spreading enumerates EVERY key, which

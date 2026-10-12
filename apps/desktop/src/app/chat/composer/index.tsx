@@ -12,6 +12,7 @@ import {
 } from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
+import { useHermesConfigRecord } from '@/app/hooks/use-config-record'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
 import { composerFloatingStrip, composerInputBacking } from '@/components/chat/composer-dock'
 import { useSetupChatView } from '@/components/onboarding-chat/assembly'
@@ -391,9 +392,15 @@ export function ChatBar({
   // Compaction does not: the gateway holds the correction until it finishes.
   const canSteer = busy && !blockingPrompt && !!onSteer && attachments.length === 0 && isSteerableText
 
+  // `display.busy_input_mode: queue` (CLI parity) swaps the busy keys: Enter
+  // queues the draft for the next turn and Cmd/Ctrl+Enter steers instead.
+  const { data: hermesConfig } = useHermesConfigRecord(profile ?? undefined)
+  const busyDisplay = hermesConfig?.display as Record<string, unknown> | undefined
+  const enterQueues = String(busyDisplay?.busy_input_mode ?? '').trim().toLowerCase() === 'queue'
+
   // While busy: text redirects the live turn (Cursor-style stop-and-correct),
   // attachments queue for the next turn, an empty composer stops.
-  const busyAction: 'steer' | 'queue' | 'stop' = canSteer
+  const busyAction: 'steer' | 'queue' | 'stop' = canSteer && !enterQueues
     ? 'steer'
     : compacting || hasComposerPayload
       ? 'queue'
@@ -412,6 +419,7 @@ export function ChatBar({
     draftRef,
     drainNextQueued,
     editorRef,
+    enterQueues,
     exitQueuedEdit,
     focusInput,
     inputDisabled,
@@ -948,6 +956,7 @@ export function ChatBar({
 
     // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter steers
     // a text-only draft, so both live-turn actions stay reachable by keyboard.
+    // In queue mode the two swap: plain Enter queues, Cmd/Ctrl+Enter steers.
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
@@ -961,7 +970,11 @@ export function ChatBar({
           setComposerText(editorText)
         }
 
-        queueDraft()
+        if (enterQueues && canSteer) {
+          steerDraft()
+        } else {
+          queueDraft()
+        }
       }
 
       return

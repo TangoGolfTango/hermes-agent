@@ -436,6 +436,42 @@ def test_oversized_text_reference_maps_host_attachment_to_container_path(
     assert "too large to inline safely" in result.message
 
 
+def _inline_staged_paste(tmp_path: Path, monkeypatch, backend: str):
+    from agent.context_references import preprocess_context_references
+
+    hermes_home = tmp_path / ".hermes"
+    attachments = hermes_home / "attachments"
+    attachments.mkdir(parents=True)
+    payload = attachments / "pasted_content_1.txt"
+    payload.write_text("pasted body\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+
+    result = preprocess_context_references(
+        f"Count the lines in @file:{payload}", cwd=tmp_path, context_length=100_000)
+    header = next(line for line in result.message.splitlines() if line.startswith("📄 "))
+    return payload, result, header
+
+
+def test_inlined_staged_text_header_names_the_container_path(tmp_path: Path, monkeypatch):
+    """Docker backend: an inlined long paste's header must also name where the agent's
+    tools can re-read the file. With only the host path, the agent's first reads of a
+    desktop paste failed before it found the mounted copy (TheMaestro acceptance)."""
+    payload, result, header = _inline_staged_paste(tmp_path, monkeypatch, "docker")
+
+    assert "pasted body" in result.message
+    assert header.startswith(f"📄 @file:{payload} (")
+    assert "/root/.hermes/attachments/pasted_content_1.txt" in header
+
+
+def test_inlined_staged_text_header_is_unchanged_on_local_backend(tmp_path: Path, monkeypatch):
+    payload, result, header = _inline_staged_paste(tmp_path, monkeypatch, "local")
+
+    assert "pasted body" in result.message
+    assert header.startswith(f"📄 @file:{payload} (")
+    assert "available at" not in header
+
+
 def test_binary_reference_block_keeps_host_path_on_local_backend(tmp_path: Path, monkeypatch):
     """Local backend: no translation — the agent's tools run on the host."""
     from agent.context_references import preprocess_context_references

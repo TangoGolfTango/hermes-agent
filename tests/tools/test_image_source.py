@@ -282,6 +282,77 @@ class TestExecReadSafety:
         assert "No such file or directory" in str(excinfo.value)
 
 
+def _posix_shell_env():
+    """A sandbox stand-in that runs the exec-read through a real POSIX shell with
+    stderr folded into the output, as the terminal environments report it."""
+    import subprocess
+
+    def execute(cmd, **kw):
+        proc = subprocess.run(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=30, check=False)
+        return {"returncode": proc.returncode, "output": proc.stdout}
+
+    return SimpleNamespace(execute=execute)
+
+
+@pytest.mark.platforms("linux", "macos")
+class TestExecReadThroughShell:
+    """The pipeline's exit status is the last stage's, so a failed read used to
+    exit 0 with the shell's error text as "output", surfacing as invalid base64
+    instead of the missing file (TheMaestro sandbox image intake)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_file_reports_not_found(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        missing = tmp_path / "work" / "missing.png"
+
+        with patch("tools.image_source._get_active_env", return_value=_posix_shell_env()):
+            with pytest.raises(isrc.SourceNotFound) as excinfo:
+                await isrc.resolve_image_source(str(missing), isrc.ResolveContext(task_id="t1"))
+        message = str(excinfo.value)
+        assert "No such file" in message
+        assert "base64" not in message
+
+    @pytest.mark.asyncio
+    async def test_unreadable_directory_reports_read_failure(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        folder = tmp_path / "work"
+        folder.mkdir()
+
+        with patch("tools.image_source._get_active_env", return_value=_posix_shell_env()):
+            with pytest.raises(isrc.SourceNotFound) as excinfo:
+                await isrc.resolve_image_source(str(folder), isrc.ResolveContext(task_id="t1"))
+        assert "base64" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_present_image_still_reads(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        image = tmp_path / "work" / "pixel.png"
+        image.parent.mkdir()
+        image.write_bytes(PNG)
+
+        with patch("tools.image_source._get_active_env", return_value=_posix_shell_env()):
+            res = await isrc.resolve_image_source(str(image), isrc.ResolveContext(task_id="t1"))
+        assert res.origin == "container"
+        assert res.data == PNG
+
+    @pytest.mark.asyncio
+    async def test_oversized_source_is_still_capped(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(isrc, "_MAX_INGEST_BYTES", len(PNG) - 1)
+        image = tmp_path / "work" / "pixel.png"
+        image.parent.mkdir()
+        image.write_bytes(PNG)
+
+        with patch("tools.image_source._get_active_env", return_value=_posix_shell_env()):
+            with pytest.raises(isrc.SourceTooLarge):
+                await isrc.resolve_image_source(str(image), isrc.ResolveContext(task_id="t1"))
+
+
 class TestSvgNormalization:
     """SVG resolves end-to-end: the resolver passes it through as
     image/svg+xml and the vision call sites rasterize it to PNG via

@@ -12,7 +12,6 @@ import {
 } from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
-import { useHermesConfigRecord } from '@/app/hooks/use-config-record'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
 import { composerFloatingStrip, composerInputBacking } from '@/components/chat/composer-dock'
 import { useSetupChatView } from '@/components/onboarding-chat/assembly'
@@ -44,6 +43,7 @@ import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
 
 import { AttachmentList } from './attachments'
+import { busyModEnterAction, resolveBusyAction, syncLiveDraft, useBusyEnterQueues } from './busy-input-mode'
 import {
   acceptsTriggerCompletion,
   COMPOSER_FADE_BACKGROUND,
@@ -392,19 +392,9 @@ export function ChatBar({
   // Compaction does not: the gateway holds the correction until it finishes.
   const canSteer = busy && !blockingPrompt && !!onSteer && attachments.length === 0 && isSteerableText
 
-  // `display.busy_input_mode: queue` (CLI parity) swaps the busy keys: Enter
-  // queues the draft for the next turn and Cmd/Ctrl+Enter steers instead.
-  const { data: hermesConfig } = useHermesConfigRecord(profile ?? undefined)
-  const busyDisplay = hermesConfig?.display as Record<string, unknown> | undefined
-  const enterQueues = String(busyDisplay?.busy_input_mode ?? '').trim().toLowerCase() === 'queue'
-
-  // While busy: text redirects the live turn (Cursor-style stop-and-correct),
-  // attachments queue for the next turn, an empty composer stops.
-  const busyAction: 'steer' | 'queue' | 'stop' = canSteer && !enterQueues
-    ? 'steer'
-    : compacting || hasComposerPayload
-      ? 'queue'
-      : 'stop'
+  // `display.busy_input_mode: queue` swaps the busy keys (see busy-input-mode).
+  const enterQueues = useBusyEnterQueues(profile)
+  const busyAction = resolveBusyAction({ canSteer, compacting, enterQueues, hasComposerPayload })
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
@@ -961,16 +951,10 @@ export function ChatBar({
       event.preventDefault()
 
       if (busy && !disabled) {
-        // As with plain Enter, source the just-typed content from the DOM so a
-        // fast keypress cannot queue a stale draft.
-        const editorText = liveComposerDraft(editorRef.current, draftRef.current)
+        // As with plain Enter, act on the live DOM text, not a stale draft.
+        syncLiveDraft(editorRef.current, draftRef, setComposerText)
 
-        if (editorText !== draftRef.current) {
-          draftRef.current = editorText
-          setComposerText(editorText)
-        }
-
-        if (enterQueues && canSteer) {
+        if (busyModEnterAction(enterQueues, canSteer) === 'steer') {
           steerDraft()
         } else {
           queueDraft()

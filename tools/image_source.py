@@ -245,7 +245,10 @@ async def _resolve_container_fallback(
     # Bound the read INSIDE the sandbox: head -c caps at ingest-limit+1 (+1 distinguishes "at the
     # cap" from "over") so /dev/zero can't stream unbounded base64 into host memory. The input
     # redirect avoids argv (leading-dash paths); tr -d instead of GNU-only base64 -w0 (BusyBox).
-    cmd = f"head -c {_MAX_INGEST_BYTES + 1} < {shlex.quote(str(p))} | base64 | tr -d '\\n'"
+    # A pipeline exits with its last stage's status, so the `: <` probe opens the file first: a
+    # missing or unreadable path fails the command with the shell's own diagnostic.
+    quoted = shlex.quote(str(p))
+    cmd = f": < {quoted} && head -c {_MAX_INGEST_BYTES + 1} < {quoted} | base64 | tr -d '\\n'"
     last_res: dict = {"returncode": 1, "output": ""}
     for attempt in range(2):
         last_res = await asyncio.to_thread(env.execute, cmd)
@@ -254,17 +257,24 @@ async def _resolve_container_fallback(
         if attempt == 0:
             await asyncio.sleep(0.15)  # covers Docker exec warm-up in practice
     if last_res.get("returncode", 1) != 0:
-        diag = (last_res.get("output") or "").strip().splitlines()
-        first = next((ln.strip() for ln in diag if ln.strip()), "")
-        suffix = f" ({first[:200]})" if first else ""
-        raise SourceNotFound(f"could not read '{p}' inside the sandbox{suffix}", src=src, origin="container")
+        raise _sandbox_read_failed(p, last_res, src)
     try:
         data = base64.b64decode(last_res.get("output", ""), validate=True)
-    except Exception as exc:
-        raise NotAnImage(f"sandbox returned non-image data for '{p}': {exc}", src=src)
+    except ValueError as exc:  # binascii.Error, or non-ASCII output
+        # Non-base64 output is the read's error text (e.g. `head` on a directory), not image data.
+        raise _sandbox_read_failed(p, last_res, src) from exc
     if len(data) > _MAX_INGEST_BYTES:
         raise SourceTooLarge("media exceeds size limit", src=src, origin="container")
     return _finalize(data, "", "container", src, permitted)
+
+
+def _sandbox_read_failed(p: Path, res: dict, src: str) -> SourceNotFound:
+    """The read error, carrying the sandbox's first output line so "no such file",
+    "permission denied" and "never came up" are distinguishable."""
+    diag = (res.get("output") or "").strip().splitlines()
+    first = next((ln.strip() for ln in diag if ln.strip()), "")
+    suffix = f" ({first[:200]})" if first else ""
+    return SourceNotFound(f"could not read '{p}' inside the sandbox{suffix}", src=src, origin="container")
 
 
 def _finalize(

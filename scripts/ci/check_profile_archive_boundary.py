@@ -16,6 +16,26 @@ from pathlib import Path
 
 _PROFILE_ARCHIVE_SUFFIXES = (".tar.gz", ".tgz")
 
+_KNOWN_DESKTOP_BUILDER_INPUT_ARCHIVES = frozenset({
+    "7zip-darwin-arm64.tar.gz",
+    "7zip-darwin-x64.tar.gz",
+    "7zip-linux-arm64.tar.gz",
+    "7zip-linux-x64.tar.gz",
+    "7zip-win32-arm64.tar.gz",
+    "7zip-win32-x64.tar.gz",
+    "icons-bundle.tar.gz",
+})
+
+
+def _is_managed_desktop_input(relpath: Path) -> bool:
+    """Return True only for recognized third-party packager tool inputs."""
+    posix_parts = relpath.as_posix().split("/")
+    # Expected under .cache/desktop-inputs/packager/builder/...
+    if len(posix_parts) >= 4 and posix_parts[:3] == [".cache", "desktop-inputs", "packager"]:
+        if posix_parts[3] == "builder" and relpath.name in _KNOWN_DESKTOP_BUILDER_INPUT_ARCHIVES:
+            return True
+    return False
+
 
 def find_forbidden_profile_archives(root: Path) -> list[Path]:
     """Return profile archive paths anywhere in the checkout."""
@@ -25,6 +45,7 @@ def find_forbidden_profile_archives(root: Path) -> list[Path]:
 
     offenders: list[Path] = []
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        dirpath = Path(directory)
         dirnames[:] = [
             name
             for name in dirnames
@@ -32,7 +53,9 @@ def find_forbidden_profile_archives(root: Path) -> list[Path]:
         ]
         for name in (*dirnames, *filenames):
             if name.casefold().endswith(_PROFILE_ARCHIVE_SUFFIXES):
-                offenders.append((Path(directory) / name).relative_to(root))
+                rel = (dirpath / name).relative_to(root)
+                if not _is_managed_desktop_input(rel):
+                    offenders.append(rel)
 
     return sorted(offenders, key=lambda path: path.as_posix().casefold())
 

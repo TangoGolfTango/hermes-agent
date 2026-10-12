@@ -159,6 +159,23 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     return candidate
 
 
+def _queue_attached_image_path(session: dict, image_path: Path) -> Path:
+    """Queue a host image for the next submit where the session's agent can read it.
+
+    A local backend reads the host path as-is. A sandboxed one (docker, ssh, ...) sees only
+    the session profile's mounted/synced ``images/`` dir, so the bytes are copied there under
+    the ``image.attach_bytes`` size cap; the user's original file is left untouched."""
+    if _session_is_local_backend(session):
+        session.setdefault("attached_images", []).append(str(image_path))
+        return image_path
+    with image_path.open("rb") as handle:
+        img_bytes = handle.read(_ATTACH_BYTES_MAX_BYTES + 1)
+    if len(img_bytes) > _ATTACH_BYTES_MAX_BYTES:
+        mb = _ATTACH_BYTES_MAX_BYTES // (1024 * 1024)
+        raise ValueError(f"image too large (cap is {mb} MB)")
+    return _queue_attached_image(session, img_bytes, image_path.suffix.lower(), prefix="attach")
+
+
 def _format_ref_value(value: str) -> str:
     """Quote a value with whitespace/brackets/quotes so the ``@file:`` ref round-trips."""
     if not value or not _ATTACHMENT_REF_NEEDS_QUOTING_RE.search(value):

@@ -279,6 +279,26 @@ class TestBuildNativeContentParts:
         assert parts[1]["type"] == "image_url"
         assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
+    def test_sandbox_path_hint_names_the_mounted_path(self, tmp_path: Path, monkeypatch):
+        """Under a docker backend the hint is what the agent's tools pass back, so it
+        must be the container path of the staged upload. The host path made the
+        agent's first vision/read retries fail and sent it hunting through older
+        cached images (TheMaestro desktop acceptance)."""
+        home = tmp_path / "hermes"
+        staged = home / "images" / "upload_1.png"
+        staged.parent.mkdir(parents=True)
+        staged.write_bytes(_png_bytes())
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        parts, skipped = build_native_content_parts("what colors?", [str(staged)])
+
+        assert skipped == []
+        assert parts[0]["text"] == "what colors?\n\n[Image attached at: /root/.hermes/images/upload_1.png]"
+        # The pixels still come from the host bytes.
+        assert parts[1]["image_url"]["url"] == (
+            "data:image/png;base64," + base64.b64encode(_png_bytes()).decode("ascii"))
+
 
 
     def test_path_hint_appended(self, tmp_path: Path):

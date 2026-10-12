@@ -383,7 +383,11 @@ def _format_file_reference(ref: ContextReference, path: Path, text: str, max_inl
         # block alone carries the message (same shape as the binary path) — a warning
         # would duplicate it in "--- Context Warnings ---".
         return None, _oversized_text_reference_block(ref, path, text_tokens)
-    return None, f"📄 {ref.raw} ({text_tokens} tokens)\n```{lang}\n{text}\n```"
+    # The ref names the gateway host path; under a sandbox the agent's tools re-read the
+    # file at its mounted/synced path, so name that too when it differs.
+    visible = _agent_visible_path(path)
+    where = f"; available at `{visible}`" if visible != str(path) else ""
+    return None, f"📄 {ref.raw} ({text_tokens} tokens{where})\n```{lang}\n{text}\n```"
 
 
 def _run_quiet(cmd: list[str], cwd: Path, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:

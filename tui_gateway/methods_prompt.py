@@ -876,9 +876,9 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
-        session.setdefault("attached_images", []).append(str(image_path))
+        queued = _queue_attached_image_path(session, image_path)
         return _ok(rid, _attached_image_result(
-            session, image_path,
+            session, queued,
             remainder=remainder, text=remainder or f"[User attached image: {image_path.name}]"))
     except Exception as e:
         return _err(rid, 5027, str(e))
@@ -1023,12 +1023,12 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"matched": False})
         drop_path, remainder = dropped["path"], dropped["remainder"]
         if dropped["is_image"]:
-            session.setdefault("attached_images", []).append(str(drop_path))
+            queued = _queue_attached_image_path(session, drop_path)
             return _ok(rid, {
-                "matched": True, "is_image": True, "path": str(drop_path),
+                "matched": True, "is_image": True, "path": str(queued),
                 "count": len(session["attached_images"]),
                 "text": remainder or f"[User attached image: {drop_path.name}]",
-                **_image_meta(drop_path)})
+                **_image_meta(queued)})
         text = f"[User attached file: {drop_path}]" + (f"\n{remainder}" if remainder else "")
         return _ok(rid, {
             "matched": True, "is_image": False, "path": str(drop_path), "name": drop_path.name,

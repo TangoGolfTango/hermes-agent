@@ -89,6 +89,126 @@ def test_a_finite_run_creates_mains_oneshot_session_so_bare_c_finds_it(store, mo
     assert client.calls[-1][1]["source"] == "cli"
 
 
+@pytest.mark.parametrize("backend", ["docker", "ssh"])
+@pytest.mark.parametrize("remote_exists_on_host", [False, True])
+@pytest.mark.parametrize("titled", [False, True])
+def test_remote_terminal_directory_is_not_the_host_session_directory(
+    store, monkeypatch, tmp_path, backend, remote_exists_on_host, titled,
+):
+    """Classic CLI admission uses the host workspace; the terminal keeps its own directory,
+    even when an unrelated directory with the same name exists on the host."""
+    import json
+    import os
+
+    from gateway.session_policy import build_policy, policy_scope
+    from hermes_cli import gateway_session_store as gss
+    from tools.terminal_tool import _get_env_config
+
+    launch, remote, home = (tmp_path / name for name in ("project", "remote", "profile"))
+    launch.mkdir()
+    home.mkdir()
+    if remote_exists_on_host:
+        remote.mkdir()
+    terminal = {"backend": backend, "cwd": str(remote)}
+    (home / "config.yaml").write_text(json.dumps({"terminal": terminal}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setenv("TERMINAL_CWD", str(remote))
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    monkeypatch.chdir(launch)
+
+    db, client = store
+    if titled:
+        monkeypatch.setattr(gss, "session_store", lambda: db)
+        assert gss.create_titled_session("Fresh Named") == "local-new"
+    else:
+        db.open_session(cli(), {"model": "m", "toolsets": ["terminal"]})
+    params = next(p for method, p in client.calls if method == "session.create")
+    assert params["cwd"] == str(launch.resolve())
+    assert params["row_cwd"] == ""
+    with policy_scope(build_policy({k: v for k, v in params.items() if k != "title"}, {})):
+        config = _get_env_config()
+    assert config["cwd"] == str(remote)
+    assert os.environ["TERMINAL_CWD"] == str(remote)
+
+
+def test_host_mounted_docker_worktree_keeps_the_host_tree_as_session_directory(store, monkeypatch, tmp_path):
+    """Docker's opt-in host-cwd mount retains a worktree even though the CLI process stays at the repo."""
+    repo, tree = tmp_path / "repo", tmp_path / "repo" / ".worktrees" / "wt"
+    tree.mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", str(tree))
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    db, client = store
+    db.open_session(cli(), {"toolsets": ["terminal"]})
+    params = next(p for method, p in client.calls if method == "session.create")
+    assert params["cwd"] == str(tree.resolve())
+    assert params["row_cwd"] == ""
+
+
+def test_in_directory_survives_the_fixed_docker_config_bridge(store, monkeypatch, tmp_path):
+    """--in changes the host workspace before CLI config restores Docker's own terminal directory."""
+    import json
+
+    from hermes_cli.main import _apply_in_dir
+    from cli import load_cli_config
+
+    launch, home, remote = (tmp_path / name for name in ("project", "profile", "container"))
+    launch.mkdir()
+    home.mkdir()
+    terminal = {"backend": "docker", "cwd": str(remote), "docker_mount_cwd_to_workspace": False}
+    (home / "config.yaml").write_text(json.dumps({"terminal": terminal}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    _apply_in_dir(types.SimpleNamespace(in_dir=str(launch)))
+    load_cli_config()
+    db, client = store
+    db.open_session(cli(), {"toolsets": ["terminal"]})
+    params = next(p for method, p in client.calls if method == "session.create")
+    assert params["cwd"] == str(launch.resolve())
+
+
+@pytest.mark.parametrize("backend", ["docker", "ssh"])
+def test_explicit_host_worktree_wins_over_a_fixed_backend_directory(store, monkeypatch, tmp_path, backend):
+    """Startup -w publishes a host tree without chdir, including for fixed remote backends."""
+    import sys
+
+    repo, tree = tmp_path / "repo", tmp_path / "repo" / ".worktrees" / "wt"
+    tree.mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setenv("TERMINAL_CWD", str(tree))
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(_active_worktree={"path": str(tree)}))
+    db, client = store
+    db.open_session(cli(), {"toolsets": ["terminal"]})
+    params = next(p for method, p in client.calls if method == "session.create")
+    assert params["cwd"] == str(tree.resolve())
+
+
+@pytest.mark.parametrize("backend", ["local", "docker"])
+def test_new_session_keeps_the_resumed_workspace_when_an_old_worktree_is_still_registered(
+    store, monkeypatch, tmp_path, backend,
+):
+    """/resume retargets cwd and TERMINAL_CWD but leaves the old worktree registered for cleanup."""
+    import sys
+
+    tree, current = tmp_path / "old-tree", tmp_path / "current-project"
+    tree.mkdir()
+    current.mkdir()
+    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(_active_worktree={"path": str(tree)}))
+    monkeypatch.chdir(current)
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setenv("TERMINAL_CWD", str(current))
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    db, client = store
+    db.create({"toolsets": ["terminal"]}, record_cwd=False)
+    params = next(p for method, p in client.calls if method == "session.create")
+    assert params["cwd"] == str(current.resolve())
+
+
 def test_resume_attaches_and_unknown_target_is_left_to_mains_not_found_path(store):
     db, client = store
     assert db.open_session(cli("local-old", resumed=True)) == "local-old"

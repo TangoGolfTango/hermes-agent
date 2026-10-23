@@ -58,6 +58,21 @@ def _zero(*_a, **_k):
     return 0
 
 
+def _host_session_cwd():
+    """The gateway's host workspace, distinct from a fixed container or remote terminal cwd."""
+    from gateway.session_policy import terminal_uses_host_cwd
+
+    # Startup -w publishes its host tree before admission without changing the process cwd.
+    # /resume may retarget TERMINAL_CWD while leaving that tree registered for cleanup.
+    terminal_cwd = os.getenv("TERMINAL_CWD")
+    worktree = getattr(sys.modules.get("cli"), "_active_worktree", None)
+    if worktree and terminal_cwd and os.path.realpath(worktree["path"]) == os.path.realpath(terminal_cwd):
+        return os.path.realpath(terminal_cwd)
+    if not terminal_uses_host_cwd(os.environ):
+        terminal_cwd = None
+    return os.path.realpath(terminal_cwd or os.getcwd())
+
+
 class GatewaySessionStore:
     """Truthy until the viewer's gateway connection is final (main's ``if self._session_db:`` guards);
     a gateway hang-up stays truthy, and the next call redials."""
@@ -164,7 +179,7 @@ class GatewaySessionStore:
         ``--create-if-missing``) leaves the row's cwd empty, as main's explicit creates did."""
         from agent.session_source import CLI_FAMILY_SOURCES, session_source_for
         params = _creation_policy(launch or {})
-        params["cwd"] = os.path.realpath(os.getenv("TERMINAL_CWD") or os.getcwd())
+        params["cwd"] = _host_session_cwd()
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
         params["source"] = session_source_for("cli")
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
@@ -543,7 +558,7 @@ def create_titled_session(title):
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
     "could not be created" copy)."""
     params = _creation_policy({})
-    params["cwd"] = os.path.realpath(os.getenv("TERMINAL_CWD") or os.getcwd())
+    params["cwd"] = _host_session_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
     params["row_cwd"] = ""
     try:

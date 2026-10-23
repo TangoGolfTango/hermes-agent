@@ -282,7 +282,7 @@ def test_task_mutation_preserves_admitted_payload_and_receipt(tmp_path, monkeypa
 
 
 def test_claimed_receipt_is_not_cancelled_or_replayed_after_owner_change(tmp_path, monkeypatch, authority):
-    home, _owner, _tid, key, tick = _pending_notification(tmp_path, monkeypatch)
+    home, owner, _tid, key, tick = _pending_notification(tmp_path, monkeypatch)
     before = authority.update(home, key, status='claimed')
     monkeypatch.setattr(live, 'find_canonical_live_owner', lambda h: {**owner, 'lease_id': 'replacement'})
     assert len(tick()) == 1

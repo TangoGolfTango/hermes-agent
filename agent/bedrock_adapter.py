@@ -347,33 +347,39 @@ _AWS_AUTH_ENV_CHAIN: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _boto3_chain_has_credentials() -> bool:
-    """True if boto3's default chain resolves credentials (IMDS, task role, ...)."""
+def _boto3_chain_has_credentials(*, instance_metadata: bool = True) -> bool:
+    """True if boto3's default chain resolves credentials (IMDS, task role, ...). *instance_metadata*
+    False skips the EC2 metadata lookup (169.254.169.254), which off EC2 only costs its timeout."""
     with suppress(Exception):
         import botocore.session
-        credentials = botocore.session.get_session().get_credentials()
+        session = botocore.session.get_session()
+        if not instance_metadata:
+            session.set_config_variable("ec2_metadata_disabled", "true")  # this session only, not os.environ
+        credentials = session.get_credentials()
         resolved = credentials.get_frozen_credentials() if credentials is not None else None
         return bool(resolved and resolved.access_key)
     return False
 
 
-def resolve_aws_auth_env_var(env: Optional[dict[str, str]] = None) -> Optional[str]:
+def resolve_aws_auth_env_var(
+    env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True,
+) -> Optional[str]:
     """Name of the active AWS auth source: env vars first (no I/O), then ``"iam-role"`` via boto3's chain, else None."""
     env = env if env is not None else os.environ
     for group in _AWS_AUTH_ENV_CHAIN:
         if all(env.get(var, "").strip() for var in group):
             return group[0]
-    return "iam-role" if _boto3_chain_has_credentials() else None
+    return "iam-role" if _boto3_chain_has_credentials(instance_metadata=instance_metadata) else None
 
 
-def has_aws_credentials(env: Optional[dict[str, str]] = None) -> bool:
+def has_aws_credentials(env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True) -> bool:
     """True if any AWS credential source (env vars or boto3 chain) is detected.
 
     This two-tier approach mirrors the pattern from OpenClaw PR #62673: cloud environments (EC2, ECS,
     Lambda) provide credentials via instance metadata, not environment variables. The env-var check is a
     fast path for local development; the boto3 fallback covers all cloud deployments.
     """
-    return resolve_aws_auth_env_var(env) is not None or _boto3_chain_has_credentials()
+    return resolve_aws_auth_env_var(env, instance_metadata=instance_metadata) is not None
 
 
 def resolve_bedrock_region(env: Optional[dict[str, str]] = None) -> str:
@@ -809,7 +815,7 @@ def _anthropic_ordered_blocks(msg: dict) -> list[dict]:
     return [block for block in converted if block is not None]
 
 
-def _reasoning_details_blocks(msg: dict, claude: bool) -> list[dict]:
+def _reasoning_details_blocks(msg: dict, claude: bool, own: bool = False) -> list[dict]:
     """Thinking from the persisted ``reasoning_details`` (Anthropic shape, as Converse captures it), in stored
     order: Claude gets signed thinking + redacted blobs, other models readable text only (falling back to
     ``reasoning_content``). This is the carrier a turn reloaded from state.db replays from, since the
@@ -819,7 +825,7 @@ def _reasoning_details_blocks(msg: dict, claude: bool) -> list[dict]:
         if not isinstance(d, dict):
             continue
         if d.get("type") == "thinking" and isinstance(d.get("thinking"), str) and d["thinking"].strip():
-            if claude and d.get("signature"):
+            if (claude or own) and d.get("signature"):
                 blocks.append(_reasoning_text_block(d["thinking"], d["signature"]))
             elif not claude:
                 blocks.append(_reasoning_text_block(d["thinking"], None))
@@ -832,7 +838,7 @@ def _reasoning_details_blocks(msg: dict, claude: bool) -> list[dict]:
     return blocks
 
 
-def _assistant_blocks(msg: dict, content, claude: bool = True) -> list[dict]:
+def _assistant_blocks(msg: dict, content, claude: bool = True, own: bool = False) -> list[dict]:
     """Assistant message → Converse blocks, from the first carrier that yields any: the ordered
     ``bedrock_content_blocks`` sidecar, (Claude only) the ordered ``anthropic_content_blocks`` sidecar,
     else thinking from ``reasoning_details`` followed by text, then tool calls. Anthropic-shaped carriers
@@ -842,7 +848,7 @@ def _assistant_blocks(msg: dict, content, claude: bool = True) -> list[dict]:
         return content_blocks
     if claude and (content_blocks := _anthropic_ordered_blocks(msg)):
         return content_blocks
-    content_blocks = _reasoning_details_blocks(msg, claude)
+    content_blocks = _reasoning_details_blocks(msg, claude, own)
     if isinstance(content, str) and content.strip():
         content_blocks.append({"text": content})
     elif isinstance(content, list):
@@ -859,11 +865,30 @@ def _assistant_blocks(msg: dict, content, claude: bool = True) -> list[dict]:
 #   strip    — DeepSeek-R1 (AWS's multi-turn sample removes reasoningContent) and Kimi K3 (Converse raises
 #              InternalServerException "when reasoning content from earlier turns is included"): prior turns
 #              lose reasoning, the in-flight loop replays the model's own blocks as captured.
+#   issuer   — OpenAI's reasoning GPTs (gpt-6 family) reject readable reasoningText in assistant history ("This
+#              model doesn't support the reasoningContent.reasoningText.text field") and stall on another GPT's
+#              sealed blobs: only turns the answering model stamped keep reasoning, verbatim so the replayed
+#              prefix stays stable; every other turn replays none, in the in-flight loop too.
 #   unsigned — every other model: prior turns carry readable reasoningText only, since their signatures and
 #              redacted blobs may be another model's (a /model switch from Claude) and non-Claude models
 #              reject them ("This model doesn't support the reasoningContent.reasoningText.signature field");
 #              the in-flight loop was produced by the model now answering and replays as captured.
+# A turn stamped by another model (CONVERSE_ISSUER_TYPE) never gets the in-flight verbatim replay: a fallback or
+# switch mid-loop hands the loop to a model that cannot open the previous one's sealed blobs (_reasoning_filter).
 _CONVERSE_REPLAY_STRIP_PATTERNS = ("deepseek.r1", "deepseek-r1", "moonshotai.kimi-k3")
+_CONVERSE_REPLAY_ISSUER_PATTERNS = ("openai.gpt-6",)  # not gpt-oss: it takes readable reasoningText
+
+
+# reasoning_details record naming the model that minted a turn's Converse reasoning: its signatures are that
+# model's own, so it gets them back unmodified on every later turn and after a reload (AWS: "include the text and
+# its signature unmodified"); any other model gets the per-policy prior-turn treatment, and Claude gets no
+# reasoning at all from a turn another family minted.
+CONVERSE_ISSUER_TYPE = "bedrock.native_assistant"
+
+
+def _issuer(msg: dict) -> Optional[str]:
+    return next((d["model"] for d in msg.get("reasoning_details") or []
+                 if isinstance(d, dict) and d.get("type") == CONVERSE_ISSUER_TYPE and isinstance(d.get("model"), str)), None)
 
 
 def _converse_replay_policy(model: Optional[str]) -> str:
@@ -874,6 +899,8 @@ def _converse_replay_policy(model: Optional[str]) -> str:
     lowered = model.lower()
     if "claude" in lowered:
         return "signed"
+    if any(p in lowered for p in _CONVERSE_REPLAY_ISSUER_PATTERNS):
+        return "issuer"
     return "strip" if any(p in lowered for p in _CONVERSE_REPLAY_STRIP_PATTERNS) else "unsigned"
 
 
@@ -897,11 +924,27 @@ _REASONING_FILTERS = {  # policy -> (before the in-flight tool loop, inside it)
     "signed": (_verbatim, _verbatim),
     "strip": (_without_reasoning, _verbatim),
     "unsigned": (_unsigned_reasoning, _verbatim),
+    "issuer": (_without_reasoning, _without_reasoning),
 }
 
 
 def _filter_reasoning(blocks: list[dict], keep) -> list[dict]:
     return [kept for kept in map(keep, blocks) if kept is not None]
+
+
+def _reasoning_filter(policy: str, issuer: Optional[str], own: bool, *, in_loop: bool):
+    """Which reasoning one assistant turn may replay to the model now answering. A turn stamped by ANOTHER
+    model (fallback or ``/model`` switch, including mid tool loop) loses the in-flight loop's verbatim replay:
+    sealed ``redactedContent`` opens only for its issuer, and Claude rejects another family's blobs outright
+    (``Invalid `data` in `redacted_thinking` block``), so a non-Claude turn replays no reasoning to Claude.
+    Unstamped turns (older sessions) keep the policy, and the rejection-driven resend covers them; under
+    ``issuer`` only the answering model's own stamped turns keep any reasoning."""
+    prior, loop = _REASONING_FILTERS[policy]
+    if own:
+        return _verbatim if in_loop or policy in ("unsigned", "issuer") else prior
+    if issuer is not None:
+        return _without_reasoning if policy == "signed" and _converse_replay_policy(issuer) != "signed" else prior
+    return loop if in_loop else prior
 
 
 def convert_messages_to_converse(
@@ -912,7 +955,6 @@ def convert_messages_to_converse(
     same-role neighbours merge, placeholder user turns pad the ends. ``model`` selects the reasoning
     replay policy for turns before the in-flight tool loop (None replays every carrier verbatim)."""
     policy = _converse_replay_policy(model)
-    prior_filter, loop_filter = _REASONING_FILTERS[policy]
     # Tool results are role "tool" here, so the last role "user" message opens the in-flight tool loop.
     loop_start = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), -1)
     system_blocks: list[dict] = []
@@ -934,9 +976,10 @@ def convert_messages_to_converse(
             append_turn("user", [{"toolResult": {
                 "toolUseId": msg.get("tool_call_id", ""), "content": [{"text": _safe_text(result_content)}]}}])
         elif role == "assistant":
-            blocks = _filter_reasoning(
-                _assistant_blocks(msg, content, claude=policy == "signed"), prior_filter if idx < loop_start else loop_filter
-            )
+            issuer = _issuer(msg) if model is not None else None
+            own = issuer is not None and issuer == model
+            keep = _reasoning_filter(policy, issuer, own, in_loop=idx >= loop_start)
+            blocks = _filter_reasoning(_assistant_blocks(msg, content, claude=policy == "signed", own=own), keep)
             append_turn("assistant", blocks or [dict(_PLACEHOLDER_BLOCK)])
         elif role == "user":
             append_turn("user", _convert_content_to_converse(content))
@@ -988,7 +1031,6 @@ class _ResponseParts:
 
     def __init__(self) -> None:
         self.text_parts: list[str] = []
-        self.reasoning_parts: list[str] = []
         self.reasoning_details: list[dict[str, Any]] = []
         self.tool_calls: list[SimpleNamespace] = []
 
@@ -1001,7 +1043,6 @@ class _ResponseParts:
             reasoning = {**reasoning, **reasoning["reasoningText"]}
         thinking_text = reasoning.get("text", "")
         if thinking_text:
-            self.reasoning_parts.append(str(thinking_text))
             if on_text:
                 on_text(thinking_text)
             block["text"] = block.get("text", "") + str(thinking_text)
@@ -1021,7 +1062,8 @@ class _ResponseParts:
             role="assistant", content="\n".join(self.text_parts) if self.text_parts else None,
             tool_calls=self.tool_calls or None,
             reasoning_details=_persisted_reasoning_details(ordered_blocks) or self.reasoning_details or None,
-            reasoning_content="\n\n".join(self.reasoning_parts) if self.reasoning_parts else None,
+            reasoning_content="\n\n".join(texts) if (texts := [b["reasoningContent"]["text"] for b in ordered_blocks
+                if isinstance(b.get("reasoningContent"), dict) and b["reasoningContent"].get("text")]) else None,
             bedrock_content_blocks=ordered_blocks or None,
         )
         cache_read_tokens, cache_write_tokens, output_tokens = (
@@ -1219,7 +1261,7 @@ def build_converse_kwargs(
     model: str, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: Optional[int] = 4096,
     temperature: Optional[float] = None, top_p: Optional[float] = None,
     stop_sequences: Optional[list[str]] = None, guardrail_config: Optional[dict] = None,
-    reasoning_config: Optional[dict] = None,
+    reasoning_config: Optional[dict] = None, prompt_cache: bool = True,
 ) -> dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` / ``converse_stream()``. ``max_tokens=None`` omits
     ``maxTokens`` (model maximum; default stays 4096). cachePoint markers go on system, tools and the
@@ -1227,7 +1269,7 @@ def build_converse_kwargs(
     model supports caching and Bedrock has not rejected that placement. ``reasoning_config`` becomes the
     model's ``additionalModelRequestFields`` reasoning switch (Claude ``thinking``, Nova 2 ``reasoningConfig``)."""
     system_prompt, converse_messages = convert_messages_to_converse(messages, model=model)
-    cache_at = {p for p in CACHE_POINT_PLACEMENTS if cache_point_allowed(model, p)} if _model_supports_prompt_cache(model) else set()
+    cache_at = {p for p in CACHE_POINT_PLACEMENTS if cache_point_allowed(model, p)} if prompt_cache and _model_supports_prompt_cache(model) else set()
     inference_config: dict[str, Any] = {} if max_tokens is None else {"maxTokens": max_tokens}
     kwargs: dict[str, Any] = {"modelId": model, "messages": converse_messages, "inferenceConfig": inference_config}
     if system_prompt:
@@ -1266,8 +1308,11 @@ def call_converse(
 ) -> SimpleNamespace:
     """Non-streaming Converse call → OpenAI-compatible response. Retries once without a rejected cachePoint
     placement; evicts the cached client on stale-connection errors."""
+    from agent.prompt_caching import is_one_shot_request
     client = _get_bedrock_runtime_client(region)
-    kwargs = build_converse_kwargs(model, messages, tools, max_tokens, temperature, top_p, stop_sequences, guardrail_config)
+    # Auxiliary-only entry point: a one-shot's cachePoint is a write no later call reads.
+    kwargs = build_converse_kwargs(model, messages, tools, max_tokens, temperature, top_p, stop_sequences, guardrail_config,
+                                   prompt_cache=not is_one_shot_request(messages, tools))
     try:
         response = client.converse(**kwargs)
     except Exception as exc:

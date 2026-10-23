@@ -26,16 +26,18 @@ def subscription_home(runner, sub):
 
 
 def _receipt_has_final_disposition(home, receipt, task_id, event_id, key):
-    from tools.bot_live_delivery import owner_holds_delivery, cancel_queued_delivery, find_canonical_live_owner
+    from tools.bot_live_delivery import cancel_queued_delivery, find_canonical_live_owner
 
-    if receipt['status'] == 'queued':
+    if receipt['status'] == 'queued' and not receipt.get('admission_id') and 'owner' in receipt:
+        # Canonical admissions belong to the authority FIFO, including migrated owner-pinned receipts.
+        # Only an unadmitted legacy mailbox record may be cancelled by a changed owner here.
         current = find_canonical_live_owner(home)
         # Absence is not proof of replacement. Same-lease compression keeps
         # the original pin viable; only a positively observed new writer can cancel it.
         replaced = current is not None and any(
             current[name] != receipt['owner'][name] for name in ('lease_id', 'live_session_id')
         )
-        if replaced and not owner_holds_delivery(home, receipt):
+        if replaced:
             receipt = cancel_queued_delivery(
                 home, key, error='Bot Chat owner changed before claim', reason='owner_changed',
             )
